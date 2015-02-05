@@ -205,7 +205,7 @@ class CanViewProjectObjFilterBackend(FilterBackend):
 
             qs = qs.filter(Q(id__in=projects_list) | Q(public_permissions__contains=["view_project"]))
         else:
-            qs = qs.filter(public_permissions__contains=["view_project"])
+            qs = qs.filter(anon_permissions__contains=["view_project"])
 
         return super().filter_queryset(request, qs.distinct(), view)
 

@@ -26,7 +26,6 @@ from django.conf import settings
 from easy_thumbnails.source_generators import pil_image
 
 from rest_framework.response import Response
-from rest_framework.filters import BaseFilterBackend
 from rest_framework import status
 
 from djmail.template_mail import MagicMailBuilder, InlineCSSTemplateMail
@@ -35,6 +34,7 @@ from taiga.auth.tokens import get_user_for_token
 from taiga.base.decorators import list_route, detail_route
 from taiga.base import exceptions as exc
 from taiga.base.api import ModelCrudViewSet
+from taiga.base.filters import PermissionBasedFilterBackend
 from taiga.base.api.utils import get_object_or_404
 from taiga.base.utils.slug import slugify_uniquely
 from taiga.projects.votes import services as votes_service
@@ -47,41 +47,59 @@ from . import permissions
 from .signals import user_cancel_account as user_cancel_account_signal
 
 
-class MembersFilterBackend(BaseFilterBackend):
+class MembersFilterBackend(PermissionBasedFilterBackend):
+    permission = "view_project"
+
     def filter_queryset(self, request, queryset, view):
-        project_id = request.QUERY_PARAMS.get('project', None)
+        project_id = None
+        project = None
+        qs = queryset
+        if "project" in request.QUERY_PARAMS:
+            try:
+                project_id = int(request.QUERY_PARAMS["project"])
+            except:
+                logger.error("Filtering project diferent value than an integer: {}".format(request.QUERY_PARAMS["project"]))
+                raise exc.BadRequest("'project' must be an integer value.")
+
         if project_id:
             Project = apps.get_model('projects', 'Project')
             project = get_object_or_404(Project, pk=project_id)
-            if request.user.is_authenticated() and project.memberships.filter(user=request.user).exists():
-                return queryset.filter(memberships__project=project).distinct()
-            else:
-                raise exc.PermissionDenied(_("You don't have permisions to see this project users."))
 
-        if request.user.is_superuser:
-            return queryset
+        if request.user.is_authenticated() and request.user.is_superuser:
+            qs = qs
+        elif request.user.is_authenticated():
+            memberships_qs = Membership.objects.filter(user=request.user)
+            if project_id:
+                memberships_qs = memberships_qs.filter(project_id=project_id)
+            memberships_qs = memberships_qs.filter(Q(role__permissions__contains=[self.permission]) |
+                                                   Q(is_owner=True))
 
-        return []
+            projects_list = [membership.project_id for membership in memberships_qs]
+
+            if project and not "view_project" in project.public_permissions:
+                qs = qs.none()
+
+            qs = qs.filter(Q(memberships__project_id__in=projects_list) |
+                           Q(memberships__project__public_permissions__contains=[self.permission])|
+                           Q(id=request.user.id))
+
+        else:
+            if project and not "view_project" in project.anon_permissions:
+                qs = qs.none()
+
+            qs = qs.filter(memberships__project__anon_permissions__contains=[self.permission])
+
+        return qs.distinct()
 
 
 class UsersViewSet(ModelCrudViewSet):
     permission_classes = (permissions.UserPermission,)
     serializer_class = serializers.UserSerializer
     queryset = models.User.objects.all()
+    filter_backends = (MembersFilterBackend,)
 
     def create(self, *args, **kwargs):
         raise exc.NotSupported()
-
-    def list(self, request, *args, **kwargs):
-        self.object_list = MembersFilterBackend().filter_queryset(request, self.get_queryset(), self)
-
-        page = self.paginate_queryset(self.object_list)
-        if page is not None:
-            serializer = self.get_pagination_serializer(page)
-        else:
-            serializer = self.get_serializer(self.object_list, many=True)
-
-        return Response(serializer.data)
 
     @list_route(methods=["POST"])
     def password_recovery(self, request, pk=None):
